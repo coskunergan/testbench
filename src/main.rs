@@ -1,15 +1,17 @@
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{web, App, HttpResponse, HttpServer, Responder, HttpRequest};
 use actix_web_actors::ws;
 use actix::{Actor, StreamHandler, ActorContext, Handler, Message, Addr, AsyncContext};
 use std::net::{TcpListener, TcpStream};
 use std::io::Read;
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
-use rand::Rng;
-use chrono::NaiveDateTime;
+use std::time::Duration;
+use chrono::{DateTime, Utc, FixedOffset};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{info, error, warn};
+use rusqlite::{Connection, Result};
+use serde::Serialize;
+use csv::WriterBuilder;
 
 // Packet counter for debugging
 static PACKET_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -124,6 +126,179 @@ async fn index() -> impl Responder {
         .body(include_str!("../static/index.html"))
 }
 
+// Initialize SQLite database
+fn init_db() -> Result<Connection> {
+    let conn = Connection::open("testbench.db")?;
+    // Create table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS packets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            barcode TEXT NOT NULL,
+            status TEXT NOT NULL
+        )",
+        [],
+    )?;
+    // Set Write-Ahead Logging (WAL) mode
+    let journal_mode: String = conn.query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))?;
+    if journal_mode != "wal" {
+        error!("Failed to set WAL mode, got: {}", journal_mode);
+    } else {
+        info!("WAL mode enabled successfully");
+    }
+    Ok(conn)
+}
+
+// Save packet to database
+fn save_packet(conn: &Connection, timestamp: &str, barcode: &str, status: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO packets (timestamp, barcode, status) VALUES (?1, ?2, ?3)",
+        [timestamp, barcode, status],
+    )?;
+    Ok(())
+}
+
+// Get all packets for display
+#[derive(Serialize)]
+struct Packet {
+    timestamp: String,
+    barcode: String,
+    status: String,
+}
+
+async fn get_packets() -> impl Responder {
+    let conn = match Connection::open("testbench.db") {
+        Ok(conn) => conn,
+        Err(e) => {
+            error!("Failed to open database: {}", e);
+            return HttpResponse::InternalServerError().body("Database error");
+        }
+    };
+    let mut stmt = match conn.prepare("SELECT timestamp, barcode, status FROM packets") {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            error!("Failed to prepare statement: {}", e);
+            return HttpResponse::InternalServerError().body("Database error");
+        }
+    };
+    let rows = match stmt.query_map([], |row| {
+        Ok(Packet {
+            timestamp: row.get(0)?,
+            barcode: row.get(1)?,
+            status: row.get(2)?,
+        })
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!("Failed to query packets: {}", e);
+            return HttpResponse::InternalServerError().body("Database error");
+        }
+    };
+    let packets: Vec<Packet> = rows.collect::<Result<Vec<_>, _>>().unwrap_or_default();
+    HttpResponse::Ok().json(packets)
+}
+
+// Basic report (OK/HATA counts)
+#[derive(Serialize)]
+struct Report {
+    ok_count: i64,
+    fail_count: i64,
+    total: i64,
+}
+
+async fn get_report(req: HttpRequest) -> impl Responder {
+    let conn = match Connection::open("testbench.db") {
+        Ok(conn) => conn,
+        Err(e) => {
+            error!("Failed to open database: {}", e);
+            return HttpResponse::InternalServerError().body("Database error");
+        }
+    };
+    let mut stmt = match conn.prepare("SELECT status, COUNT(*) FROM packets GROUP BY status") {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            error!("Failed to prepare statement: {}", e);
+            return HttpResponse::InternalServerError().body("Database error");
+        }
+    };
+    let rows = match stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!("Failed to query report: {}", e);
+            return HttpResponse::InternalServerError().body("Database error");
+        }
+    };
+    let mut ok_count = 0;
+    let mut fail_count = 0;
+    for row in rows {
+        let (status, count) = row.unwrap();
+        if status == "OK" {
+            ok_count = count;
+        } else if status == "HATA" {
+            fail_count = count;
+        }
+    }
+    let report = Report {
+        ok_count,
+        fail_count,
+        total: ok_count + fail_count,
+    };
+    HttpResponse::Ok().json(report)
+}
+
+// Export packets as CSV
+async fn export_csv() -> impl Responder {
+    let conn = match Connection::open("testbench.db") {
+        Ok(conn) => conn,
+        Err(e) => {
+            error!("Failed to open database: {}", e);
+            return HttpResponse::InternalServerError().body("Database error");
+        }
+    };
+    let mut stmt = match conn.prepare("SELECT timestamp, barcode, status FROM packets") {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            error!("Failed to prepare statement: {}", e);
+            return HttpResponse::InternalServerError().body("Database error");
+        }
+    };
+    let rows = match stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!("Failed to query packets: {}", e);
+            return HttpResponse::InternalServerError().body("Database error");
+        }
+    };
+
+    let mut wtr = WriterBuilder::new().from_writer(vec![]);
+    wtr.write_record(["Zaman", "Barkod", "Durum"]).unwrap();
+    for row in rows {
+        let (timestamp, barcode, status) = row.unwrap();
+        wtr.write_record([timestamp, barcode, status]).unwrap();
+    }
+    let data = match wtr.into_inner() {
+        Ok(data) => data,
+        Err(e) => {
+            error!("Failed to generate CSV: {}", e);
+            return HttpResponse::InternalServerError().body("CSV error");
+        }
+    };
+
+    // Generate timestamp for filename in Istanbul timezone (UTC+3)
+    let istanbul_offset = FixedOffset::east_opt(3 * 3600).unwrap(); // UTC+3
+    let datetime: DateTime<FixedOffset> = Utc::now().with_timezone(&istanbul_offset);
+    let filename = format!("data_{}.csv", datetime.format("%Y-%m-%d_%H-%M-%S"));
+
+    HttpResponse::Ok()
+        .content_type("text/csv")
+        .append_header(("Content-Disposition", format!("attachment; filename=\"{}\"", filename)))
+        .body(data)
+}
+
 fn tcp_server(sender: SyncSender<String>) {
     let listener = match TcpListener::bind("0.0.0.0:5209") {
         Ok(listener) => listener,
@@ -153,6 +328,7 @@ fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
     let mut buffer = [0; 1024];
     let mut temp_buffer = Vec::new(); // Only used for incomplete packets
     const PACKET_LENGTH: usize = 13; // Assuming 13 bytes for OK/FAIL check
+    let conn = init_db().expect("Failed to initialize database");
 
     loop {
         match stream.read(&mut buffer) {
@@ -169,11 +345,11 @@ fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
                     let packet_id = PACKET_COUNT.fetch_add(1, Ordering::SeqCst);
                     let hex = packet.iter().map(|b| format!("{:02X} ", b)).collect::<String>().trim().to_string();
 
-                    // Check 13th byte for OK/FAIL (index 12, 0-based)
+                    // Check 13th byte for OK/HATA (index 12, 0-based)
                     let status = if packet.len() > 12 {
                         match packet[12] {
                             0x02 => "OK",
-                            0x03 => "FAIL",
+                            0x03 => "HATA",
                             _ => "Unknown",
                         }
                     } else {
@@ -183,25 +359,29 @@ fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
                     // Log all packets
                     info!("Packet {} from ({:?}): Hex: {}, status: {}", packet_id, stream.peer_addr(), hex, status);
 
-                    // Only send OK or FAIL packets to WebSocket
-                    if status == "OK" || status == "FAIL" {
-                        // Generate random 10-digit barcode
-                        let barcode: u64 = rand::thread_rng().gen_range(1_000_000_000..10_000_000_000);
+                    // Only process OK or HATA packets
+                    if status == "OK" || status == "HATA" {
+                        // Get barcode from bytes 3 to 8 (index 2 to 7, 6 bytes)
+                        let barcode: String = packet[2..8]
+                            .iter()
+                            .map(|b| format!("{:02X}", b))
+                            .collect::<Vec<String>>()
+                            .join("");
 
-                        // Get current timestamp
-                        let timestamp = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs();
-                        let datetime = NaiveDateTime::from_timestamp_opt(timestamp as i64, 0)
-                            .unwrap()
-                            .format("%Y-%m-%d %H:%M:%S")
-                            .to_string();
+                        // Get current timestamp in Istanbul timezone (UTC+3)
+                        let istanbul_offset = FixedOffset::east_opt(3 * 3600).unwrap(); // UTC+3
+                        let datetime: DateTime<FixedOffset> = Utc::now().with_timezone(&istanbul_offset);
+                        let formatted_datetime = datetime.format("%Y-%m-%d %H:%M:%S").to_string();
 
-                        // Send data to WebSocket clients as JSON (without hex)
+                        // Save to database
+                        if let Err(e) = save_packet(&conn, &formatted_datetime, &barcode, status) {
+                            error!("Failed to save packet {} to database: {}", packet_id, e);
+                        }
+
+                        // Send to WebSocket
                         let json = format!(
                             "{{\"timestamp\": \"{}\", \"barcode\": \"{}\", \"status\": \"{}\"}}",
-                            datetime, barcode, status
+                            formatted_datetime, barcode, status
                         );
                         if let Err(e) = sender.send(json) {
                             error!("Error sending packet {} to channel: {}", packet_id, e);
@@ -267,6 +447,16 @@ async fn main() -> std::io::Result<()> {
         .with_max_level(tracing::Level::INFO)
         .init();
 
+    // Initialize database
+    let conn = match init_db() {
+        Ok(conn) => conn,
+        Err(e) => {
+            error!("Failed to initialize database: {}", e);
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Database initialization failed: {}", e)));
+        }
+    };
+    info!("Database initialized successfully");
+
     // Start the broadcaster actor
     let broadcaster = Broadcaster { clients: vec![] }.start();
 
@@ -295,6 +485,9 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(broadcaster.clone()))
             .route("/", web::get().to(index))
             .route("/ws/", web::get().to(ws_index))
+            .route("/packets", web::get().to(get_packets))
+            .route("/report", web::get().to(get_report))
+            .route("/export", web::get().to(export_csv))
     })
     .bind("127.0.0.1:8080")?
     .run()

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Kitchen-ART Test Cihazı Verileri</title>
+    <title>Kitchen-ART Test Masası</title>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -30,31 +30,51 @@
             color: white;
             text-align: center;
         }
-        .status-fail {
+        .status-hata {
             background-color: red;
             color: white;
             text-align: center;
         }
         /* Column widths */
-        th:nth-child(1), td:nth-child(1) { /* TIMESTAMP */
+        th:nth-child(1), td:nth-child(1) { /* Zaman */
             width: 20%;
         }
-        th:nth-child(2), td:nth-child(2) { /* BARCODE */
+        th:nth-child(2), td:nth-child(2) { /* Barkod */
             width: 20%;
         }
-        th:nth-child(3), td:nth-child(3) { /* STATUS */
+        th:nth-child(3), td:nth-child(3) { /* Durum */
             width: 60%;
+        }
+        button {
+            margin: 10px 0;
+            padding: 8px 16px;
+        }
+        #report {
+            margin: 10px 0;
+            font-weight: bold;
+            font-size: 18px;
+        }
+        #report .ok {
+            color: green;
+        }
+        #report .fail {
+            color: red;
+        }
+        #report .total {
+            color: black;
         }
     </style>
 </head>
 <body>
-    <h1>Kitchen-ART Test Cihazı Verileri</h1>
+    <h1>Kitchen-ART Test Masası</h1>
+    <button onclick="exportCsv()">CSV İndir</button>
+    <div id="report">Rapor: <span class="ok">OK: 0</span>, <span class="fail">HATA: 0</span>, <span class="total">Toplam: 0</span></div>
     <table id="data-table">
         <thead>
             <tr>
-                <th>TIMESTAMP</th>
-                <th>BARCODE</th>
-                <th>STATUS</th>
+                <th>Zaman</th>
+                <th>Barkod</th>
+                <th>Durum</th>
             </tr>
         </thead>
         <tbody></tbody>
@@ -63,6 +83,42 @@
     <script>
         const ws = new WebSocket('ws://' + window.location.host + '/ws/');
         const tableBody = document.querySelector('#data-table tbody');
+        const reportDiv = document.getElementById('report');
+
+        // Load past packets on page load
+        async function loadPackets() {
+            try {
+                const response = await fetch('/packets');
+                const packets = await response.json();
+                tableBody.innerHTML = '';
+                packets.reverse().forEach(data => {
+                    const row = document.createElement('tr');
+                    row.innerHTML = `
+                        <td>${data.timestamp}</td>
+                        <td>${data.barcode}</td>
+                        <td class="${data.status === 'OK' ? 'status-ok' : 'status-hata'}">${data.status}</td>
+                    `;
+                    tableBody.appendChild(row);
+                });
+            } catch (e) {
+                console.error('Error fetching packets:', e);
+            }
+        }
+
+        // Update report
+        async function updateReport() {
+            try {
+                const response = await fetch('/report');
+                const report = await response.json();
+                reportDiv.innerHTML = `Rapor: <span class="ok">OK: ${report.ok_count}</span>, <span class="fail">HATA: ${report.fail_count}</span>, <span class="total">Toplam: ${report.total}</span>`;
+            } catch (e) {
+                console.error('Error fetching report:', e);
+            }
+        }
+
+        // Initial load
+        loadPackets();
+        updateReport();
 
         ws.onmessage = function(event) {
             try {
@@ -73,9 +129,12 @@
                 row.innerHTML = `
                     <td>${data.timestamp}</td>
                     <td>${data.barcode}</td>
-                    <td class="${data.status === 'OK' ? 'status-ok' : 'status-fail'}">${data.status}</td>
+                    <td class="${data.status === 'OK' ? 'status-ok' : 'status-hata'}">${data.status}</td>
                 `;
                 tableBody.insertBefore(row, tableBody.firstChild);
+
+                // Update report on new packet
+                updateReport();
             } catch (e) {
                 console.error('Error parsing WebSocket message:', e);
             }
@@ -88,6 +147,10 @@
         ws.onclose = function() {
             console.log('WebSocket connection closed');
         };
+
+        function exportCsv() {
+            window.location.href = '/export';
+        }
     </script>
 </body>
 </html>
