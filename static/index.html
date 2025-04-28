@@ -35,14 +35,13 @@
             color: white;
             text-align: center;
         }
-        /* Column widths */
-        th:nth-child(1), td:nth-child(1) { /* Zaman */
+        th:nth-child(1), td:nth-child(1) {
             width: 20%;
         }
-        th:nth-child(2), td:nth-child(2) { /* Barkod */
+        th:nth-child(2), td:nth-child(2) {
             width: 20%;
         }
-        th:nth-child(3), td:nth-child(3) { /* Durum */
+        th:nth-child(3), td:nth-child(3) {
             width: 60%;
         }
         button {
@@ -85,7 +84,6 @@
         const tableBody = document.querySelector('#data-table tbody');
         const reportDiv = document.getElementById('report');
 
-        // Load past packets on page load
         async function loadPackets() {
             try {
                 const response = await fetch('/packets');
@@ -105,7 +103,6 @@
             }
         }
 
-        // Update report
         async function updateReport() {
             try {
                 const response = await fetch('/report');
@@ -116,7 +113,6 @@
             }
         }
 
-        // Initial load
         loadPackets();
         updateReport();
 
@@ -125,16 +121,23 @@
                 const data = JSON.parse(event.data);
                 console.log('Received WebSocket message:', data);
 
-                const row = document.createElement('tr');
-                row.innerHTML = `
-                    <td>${data.timestamp}</td>
-                    <td>${data.barcode}</td>
-                    <td class="${data.status === 'OK' ? 'status-ok' : 'status-hata'}">${data.status}</td>
-                `;
-                tableBody.insertBefore(row, tableBody.firstChild);
-
-                // Update report on new packet
-                updateReport();
+                if (data.action === 'export_csv') {
+                    console.log('Triggering CSV export');
+                    exportCsv();
+                } else if (data.action === 'clear_database') {
+                    console.log('Clearing database display');
+                    tableBody.innerHTML = '';
+                    reportDiv.innerHTML = `Rapor: <span class="ok">OK: 0</span>, <span class="fail">HATA: 0</span>, <span class="total">Toplam: 0</span>`;
+                } else {
+                    const row = document.createElement('tr');
+                    row.innerHTML = `
+                        <td>${data.timestamp}</td>
+                        <td>${data.barcode}</td>
+                        <td class="${data.status === 'OK' ? 'status-ok' : 'status-hata'}">${data.status}</td>
+                    `;
+                    tableBody.insertBefore(row, tableBody.firstChild);
+                    updateReport();
+                }
             } catch (e) {
                 console.error('Error parsing WebSocket message:', e);
             }

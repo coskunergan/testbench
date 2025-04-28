@@ -16,6 +16,10 @@ use csv::WriterBuilder;
 // Packet counter for debugging
 static PACKET_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+// Barcode keys
+const BARCODE_KEY: &str = "010203040507"; // For CSV export
+const BARCODE_KEY_CLEAR: &str = "010203040508"; // For clearing database
+
 // Broadcaster actor to manage WebSocket clients and broadcast messages
 struct Broadcaster {
     clients: Vec<Addr<WsSession>>,
@@ -129,7 +133,6 @@ async fn index() -> impl Responder {
 // Initialize SQLite database
 fn init_db() -> Result<Connection> {
     let conn = Connection::open("testbench.db")?;
-    // Create table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS packets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,7 +142,6 @@ fn init_db() -> Result<Connection> {
         )",
         [],
     )?;
-    // Set Write-Ahead Logging (WAL) mode
     let journal_mode: String = conn.query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))?;
     if journal_mode != "wal" {
         error!("Failed to set WAL mode, got: {}", journal_mode);
@@ -155,6 +157,13 @@ fn save_packet(conn: &Connection, timestamp: &str, barcode: &str, status: &str) 
         "INSERT INTO packets (timestamp, barcode, status) VALUES (?1, ?2, ?3)",
         [timestamp, barcode, status],
     )?;
+    Ok(())
+}
+
+// Clear all data from packets table
+fn clear_database(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM packets", [])?;
+    info!("Database cleared successfully");
     Ok(())
 }
 
@@ -289,7 +298,7 @@ async fn export_csv() -> impl Responder {
     };
 
     // Generate timestamp for filename in Istanbul timezone (UTC+3)
-    let istanbul_offset = FixedOffset::east_opt(3 * 3600).unwrap(); // UTC+3
+    let istanbul_offset = FixedOffset::east_opt(3 * 3600).unwrap();
     let datetime: DateTime<FixedOffset> = Utc::now().with_timezone(&istanbul_offset);
     let filename = format!("data_{}.csv", datetime.format("%Y-%m-%d_%H-%M-%S"));
 
@@ -326,8 +335,8 @@ fn tcp_server(sender: SyncSender<String>) {
 
 fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
     let mut buffer = [0; 1024];
-    let mut temp_buffer = Vec::new(); // Only used for incomplete packets
-    const PACKET_LENGTH: usize = 13; // Assuming 13 bytes for OK/FAIL check
+    let mut temp_buffer = Vec::new();
+    const PACKET_LENGTH: usize = 13;
     let conn = init_db().expect("Failed to initialize database");
 
     loop {
@@ -339,13 +348,11 @@ fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
             Ok(n) => {
                 let data = &buffer[..n];
 
-                // Process packets directly from data
                 let mut offset = 0;
                 while let Some((packet, next_offset)) = extract_packet(&data[offset..]) {
                     let packet_id = PACKET_COUNT.fetch_add(1, Ordering::SeqCst);
                     let hex = packet.iter().map(|b| format!("{:02X} ", b)).collect::<String>().trim().to_string();
 
-                    // Check 13th byte for OK/HATA (index 12, 0-based)
                     let status = if packet.len() > 12 {
                         match packet[12] {
                             0x02 => "OK",
@@ -356,29 +363,48 @@ fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
                         "Invalid (too short)"
                     };
 
-                    // Log all packets
                     info!("Packet {} from ({:?}): Hex: {}, status: {}", packet_id, stream.peer_addr(), hex, status);
 
-                    // Only process OK or HATA packets
                     if status == "OK" || status == "HATA" {
-                        // Get barcode from bytes 3 to 8 (index 2 to 7, 6 bytes)
                         let barcode: String = packet[2..8]
                             .iter()
                             .map(|b| format!("{:02X}", b))
                             .collect::<Vec<String>>()
                             .join("");
 
-                        // Get current timestamp in Istanbul timezone (UTC+3)
-                        let istanbul_offset = FixedOffset::east_opt(3 * 3600).unwrap(); // UTC+3
+                        // Check for CSV export
+                        if barcode == BARCODE_KEY {
+                            info!("Barcode {} matches CSV key, triggering CSV export", barcode);
+                            let json = r#"{"action": "export_csv"}"#.to_string();
+                            if let Err(e) = sender.send(json) {
+                                error!("Error sending export_csv signal for barcode {}: {}", barcode, e);
+                            } else {
+                                info!("Export CSV signal sent for barcode {}", barcode);
+                            }
+                        }
+                        // Check for database clear
+                        else if barcode == BARCODE_KEY_CLEAR {
+                            info!("Barcode {} matches clear key, clearing database", barcode);
+                            if let Err(e) = clear_database(&conn) {
+                                error!("Error clearing database for barcode {}: {}", barcode, e);
+                            } else {
+                                let json = r#"{"action": "clear_database"}"#.to_string();
+                                if let Err(e) = sender.send(json) {
+                                    error!("Error sending clear_database signal for barcode {}: {}", barcode, e);
+                                } else {
+                                    info!("Clear database signal sent for barcode {}", barcode);
+                                }
+                            }
+                        }
+
+                        let istanbul_offset = FixedOffset::east_opt(3 * 3600).unwrap();
                         let datetime: DateTime<FixedOffset> = Utc::now().with_timezone(&istanbul_offset);
                         let formatted_datetime = datetime.format("%Y-%m-%d %H:%M:%S").to_string();
 
-                        // Save to database
                         if let Err(e) = save_packet(&conn, &formatted_datetime, &barcode, status) {
                             error!("Failed to save packet {} to database: {}", packet_id, e);
                         }
 
-                        // Send to WebSocket
                         let json = format!(
                             "{{\"timestamp\": \"{}\", \"barcode\": \"{}\", \"status\": \"{}\"}}",
                             formatted_datetime, barcode, status
@@ -393,7 +419,6 @@ fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
                     offset += next_offset;
                 }
 
-                // Store remaining data (incomplete packet) in temp_buffer
                 if offset < data.len() {
                     temp_buffer.extend_from_slice(&data[offset..]);
                 } else {
@@ -406,19 +431,15 @@ fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
             }
         }
 
-        // Sleep briefly to prevent tight loop
         thread::sleep(Duration::from_millis(1));
     }
 }
 
-// Extract a single packet from the buffer slice (assuming 5A A5 start, 13 bytes long)
 fn extract_packet(buffer: &[u8]) -> Option<(&[u8], usize)> {
-    // Find start of packet (5A A5)
     let start = match buffer.windows(2).position(|window| window == [0x5A, 0xA5]) {
         Some(pos) => pos,
         None => {
             if !buffer.is_empty() {
-                // Log invalid data
                 let invalid_data = buffer.iter().map(|b| format!("{:02X} ", b)).collect::<String>().trim().to_string();
                 warn!("Invalid data skipped (no 5A A5 start): {}", invalid_data);
             }
@@ -426,28 +447,22 @@ fn extract_packet(buffer: &[u8]) -> Option<(&[u8], usize)> {
         }
     };
 
-    // Check if enough data for a full packet (13 bytes)
     const PACKET_LENGTH: usize = 13;
     if buffer.len() < start + PACKET_LENGTH {
-        // Not enough data, keep for next read
         return None;
     }
 
-    // Extract packet (13 bytes)
     let packet = &buffer[start..start + PACKET_LENGTH];
-    // Return packet and offset to next data
     let next_offset = start + PACKET_LENGTH;
     Some((packet, next_offset))
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
 
-    // Initialize database
     let conn = match init_db() {
         Ok(conn) => conn,
         Err(e) => {
@@ -457,19 +472,14 @@ async fn main() -> std::io::Result<()> {
     };
     info!("Database initialized successfully");
 
-    // Start the broadcaster actor
     let broadcaster = Broadcaster { clients: vec![] }.start();
-
-    // Create channel with buffer size
     let (sender, receiver) = sync_channel::<String>(1000);
 
-    // Start TCP server in a separate thread
     let sender_clone = sender.clone();
     thread::spawn(move || {
         tcp_server(sender_clone);
     });
 
-    // Process received messages and send to broadcaster
     let broadcaster_clone = broadcaster.clone();
     thread::spawn(move || {
         let mut packet_id = 0;
@@ -479,7 +489,6 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
-    // Start HTTP server
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(broadcaster.clone()))
