@@ -160,6 +160,23 @@ fn save_packet(conn: &Connection, timestamp: &str, barcode: &str, status: &str) 
     Ok(())
 }
 
+// Update packet in database
+fn update_packet(conn: &Connection, barcode: &str, timestamp: &str, status: &str) -> Result<bool> {
+    let mut stmt = conn.prepare("SELECT id FROM packets WHERE barcode = ?1 AND status = 'TEST' ORDER BY id DESC LIMIT 1")?;
+    let mut rows = stmt.query([barcode])?;
+    if let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        conn.execute(
+            "UPDATE packets SET timestamp = ?1, status = ?2 WHERE id = ?3",
+            [timestamp, status, &id.to_string()],
+        )?;
+        info!("Updated packet id {} for barcode {} to status {}", id, barcode, status);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 // Clear all data from packets table
 fn clear_database(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM packets", [])?;
@@ -243,10 +260,10 @@ async fn get_report(req: HttpRequest) -> impl Responder {
     let mut fail_count = 0;
     for row in rows {
         let (status, count) = row.unwrap();
-        if status == "OK" {
-            ok_count = count;
-        } else if status == "HATA" {
-            fail_count = count;
+        match status.as_str() {
+            "OK" => ok_count = count,
+            "HATA" => fail_count = count,
+            _ => {}
         }
     }
     let report = Report {
@@ -357,6 +374,7 @@ fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
                         match packet[12] {
                             0x02 => "OK",
                             0x03 => "HATA",
+                            0x04 => "TEST",
                             _ => "Unknown",
                         }
                     } else {
@@ -365,14 +383,14 @@ fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
 
                     info!("Packet {} from ({:?}): Hex: {}, status: {}", packet_id, stream.peer_addr(), hex, status);
 
-                    if status == "OK" || status == "HATA" {
+                    if status == "OK" || status == "HATA" || status == "TEST" {
                         let barcode: String = packet[2..8]
                             .iter()
                             .map(|b| format!("{:02X}", b))
                             .collect::<Vec<String>>()
                             .join("");
 
-                        // Check for CSV export
+                        // Handle special barcode keys
                         if barcode == BARCODE_KEY {
                             info!("Barcode {} matches CSV key, triggering CSV export", barcode);
                             let json = r#"{"action": "export_csv"}"#.to_string();
@@ -381,9 +399,7 @@ fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
                             } else {
                                 info!("Export CSV signal sent for barcode {}", barcode);
                             }
-                        }
-                        // Check for database clear
-                        else if barcode == BARCODE_KEY_CLEAR {
+                        } else if barcode == BARCODE_KEY_CLEAR {
                             info!("Barcode {} matches clear key, clearing database", barcode);
                             if let Err(e) = clear_database(&conn) {
                                 error!("Error clearing database for barcode {}: {}", barcode, e);
@@ -401,18 +417,38 @@ fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
                         let datetime: DateTime<FixedOffset> = Utc::now().with_timezone(&istanbul_offset);
                         let formatted_datetime = datetime.format("%Y-%m-%d %H:%M:%S").to_string();
 
-                        if let Err(e) = save_packet(&conn, &formatted_datetime, &barcode, status) {
-                            error!("Failed to save packet {} to database: {}", packet_id, e);
-                        }
-
-                        let json = format!(
-                            "{{\"timestamp\": \"{}\", \"barcode\": \"{}\", \"status\": \"{}\"}}",
-                            formatted_datetime, barcode, status
-                        );
-                        if let Err(e) = sender.send(json) {
-                            error!("Error sending packet {} to channel: {}", packet_id, e);
+                        // Check if we need to update an existing TEST packet
+                        let updated = if status == "OK" || status == "HATA" {
+                            update_packet(&conn, &barcode, &formatted_datetime, status).unwrap_or(false)
                         } else {
-                            info!("Packet {} sent to broadcaster", packet_id);
+                            false
+                        };
+
+                        // If updated, send update message; otherwise, save new packet
+                        if updated {
+                            let json = format!(
+                                "{{\"action\": \"update\", \"barcode\": \"{}\", \"timestamp\": \"{}\", \"status\": \"{}\"}}",
+                                barcode, formatted_datetime, status
+                            );
+                            if let Err(e) = sender.send(json) {
+                                error!("Error sending update packet {} to channel: {}", packet_id, e);
+                            } else {
+                                info!("Update packet {} sent to broadcaster", packet_id);
+                            }
+                        } else {
+                            if let Err(e) = save_packet(&conn, &formatted_datetime, &barcode, status) {
+                                error!("Failed to save packet {} to database: {}", packet_id, e);
+                            }
+
+                            let json = format!(
+                                "{{\"timestamp\": \"{}\", \"barcode\": \"{}\", \"status\": \"{}\"}}",
+                                formatted_datetime, barcode, status
+                            );
+                            if let Err(e) = sender.send(json) {
+                                error!("Error sending packet {} to channel: {}", packet_id, e);
+                            } else {
+                                info!("Packet {} sent to broadcaster", packet_id);
+                            }
                         }
                     }
 

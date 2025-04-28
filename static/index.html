@@ -35,6 +35,11 @@
             color: white;
             text-align: center;
         }
+        .status-test {
+            background-color: orange;
+            color: white;
+            text-align: center;
+        }
         th:nth-child(1), td:nth-child(1) {
             width: 20%;
         }
@@ -94,7 +99,7 @@
                     row.innerHTML = `
                         <td>${data.timestamp}</td>
                         <td>${data.barcode}</td>
-                        <td class="${data.status === 'OK' ? 'status-ok' : 'status-hata'}">${data.status}</td>
+                        <td class="${data.status === 'OK' ? 'status-ok' : data.status === 'HATA' ? 'status-hata' : 'status-test'}">${data.status}</td>
                     `;
                     tableBody.appendChild(row);
                 });
@@ -128,12 +133,25 @@
                     console.log('Clearing database display');
                     tableBody.innerHTML = '';
                     reportDiv.innerHTML = `Rapor: <span class="ok">OK: 0</span>, <span class="fail">HATA: 0</span>, <span class="total">Toplam: 0</span>`;
+                } else if (data.action === 'update') {
+                    console.log('Updating packet for barcode:', data.barcode);
+                    const rows = tableBody.getElementsByTagName('tr');
+                    for (let row of rows) {
+                        const barcodeCell = row.cells[1];
+                        if (barcodeCell && barcodeCell.textContent === data.barcode) {
+                            row.cells[0].textContent = data.timestamp;
+                            row.cells[2].className = data.status === 'OK' ? 'status-ok' : 'status-hata';
+                            row.cells[2].textContent = data.status;
+                            break;
+                        }
+                    }
+                    updateReport();
                 } else {
                     const row = document.createElement('tr');
                     row.innerHTML = `
                         <td>${data.timestamp}</td>
                         <td>${data.barcode}</td>
-                        <td class="${data.status === 'OK' ? 'status-ok' : 'status-hata'}">${data.status}</td>
+                        <td class="${data.status === 'OK' ? 'status-ok' : data.status === 'HATA' ? 'status-hata' : 'status-test'}">${data.status}</td>
                     `;
                     tableBody.insertBefore(row, tableBody.firstChild);
                     updateReport();
