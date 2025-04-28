@@ -67,12 +67,15 @@
         #report .total {
             color: black;
         }
+        #report .count {
+            font-size: 72px;
+        }
     </style>
 </head>
 <body>
     <h1>Kitchen-ART Test Masası</h1>
     <button onclick="exportCsv()">CSV İndir</button>
-    <div id="report">Rapor: <span class="ok">OK: 0</span>, <span class="fail">HATA: 0</span>, <span class="total">Toplam: 0</span></div>
+    <div id="report"><span class="ok">OK: <span class="count">0</span></span>, <span class="fail">HATA: <span class="count">0</span></span>, <span class="total">Toplam: <span class="count">0</span></span></div>
     <table id="data-table">
         <thead>
             <tr>
@@ -88,6 +91,8 @@
         const ws = new WebSocket('ws://' + window.location.host + '/ws/');
         const tableBody = document.querySelector('#data-table tbody');
         const reportDiv = document.getElementById('report');
+        const BARCODE_KEY_SAVE = 'SAVE_DB';
+        const BARCODE_KEY_CLEAR = 'DEL_DB';
 
         async function loadPackets() {
             try {
@@ -95,6 +100,10 @@
                 const packets = await response.json();
                 tableBody.innerHTML = '';
                 packets.reverse().forEach(data => {
+                    if (data.barcode === BARCODE_KEY_SAVE || data.barcode === BARCODE_KEY_CLEAR) {
+                        console.log(`Skipping packet with barcode ${data.barcode} in table`);
+                        return;
+                    }
                     const row = document.createElement('tr');
                     row.innerHTML = `
                         <td>${data.timestamp}</td>
@@ -112,7 +121,7 @@
             try {
                 const response = await fetch('/report');
                 const report = await response.json();
-                reportDiv.innerHTML = `Rapor: <span class="ok">OK: ${report.ok_count}</span>, <span class="fail">HATA: ${report.fail_count}</span>, <span class="total">Toplam: ${report.total}</span>`;
+                reportDiv.innerHTML = `<span class="ok">OK: <span class="count">${report.ok_count}</span></span>, <span class="fail">HATA: <span class="count">${report.fail_count}</span></span>, <span class="total">Toplam: <span class="count">${report.total}</span></span>`;
             } catch (e) {
                 console.error('Error fetching report:', e);
             }
@@ -132,21 +141,30 @@
                 } else if (data.action === 'clear_database') {
                     console.log('Clearing database display');
                     tableBody.innerHTML = '';
-                    reportDiv.innerHTML = `Rapor: <span class="ok">OK: 0</span>, <span class="fail">HATA: 0</span>, <span class="total">Toplam: 0</span>`;
+                    reportDiv.innerHTML = `<span class="ok">OK: <span class="count">0</span></span>, <span class="fail">HATA: <span class="count">0</span></span>, <span class="total">Toplam: <span class="count">0</span></span>`;
                 } else if (data.action === 'update') {
                     console.log('Updating packet for barcode:', data.barcode);
+                    if (data.barcode === BARCODE_KEY_SAVE || data.barcode === BARCODE_KEY_CLEAR) {
+                        console.log(`Skipping update for barcode ${data.barcode} in table`);
+                        updateReport();
+                        return;
+                    }
                     const rows = tableBody.getElementsByTagName('tr');
                     for (let row of rows) {
                         const barcodeCell = row.cells[1];
                         if (barcodeCell && barcodeCell.textContent === data.barcode) {
                             row.cells[0].textContent = data.timestamp;
-                            row.cells[2].className = data.status === 'OK' ? 'status-ok' : 'status-hata';
+                            row.cells[2].className = data.status === 'OK' ? 'status-ok' : data.status === 'HATA' ? 'status-hata' : 'status-test';
                             row.cells[2].textContent = data.status;
                             break;
                         }
                     }
                     updateReport();
                 } else {
+                    if (data.barcode === BARCODE_KEY_SAVE || data.barcode === BARCODE_KEY_CLEAR) {
+                        console.log(`Skipping packet with barcode ${data.barcode} in table`);
+                        return;
+                    }
                     const row = document.createElement('tr');
                     row.innerHTML = `
                         <td>${data.timestamp}</td>

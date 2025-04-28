@@ -1472,6 +1472,7 @@ dependencies = [
  "actix-web-actors",
  "chrono",
  "csv",
+ "lazy_static",
  "rand 0.8.5",
  "rusqlite",
  "serde",

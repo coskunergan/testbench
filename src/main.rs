@@ -1,24 +1,33 @@
-use actix_web::{web, App, HttpResponse, HttpServer, Responder, HttpRequest};
+use actix::{Actor, ActorContext, Addr, AsyncContext, Handler, Message, StreamHandler};
+use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use actix_web_actors::ws;
-use actix::{Actor, StreamHandler, ActorContext, Handler, Message, Addr, AsyncContext};
-use std::net::{TcpListener, TcpStream};
+use chrono::{DateTime, FixedOffset, Utc};
+use csv::WriterBuilder;
+use rusqlite::{Connection, Result};
+use serde::Serialize;
 use std::io::Read;
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread;
 use std::time::Duration;
-use chrono::{DateTime, Utc, FixedOffset};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use tracing::{info, error, warn};
-use rusqlite::{Connection, Result};
-use serde::Serialize;
-use csv::WriterBuilder;
+use tracing::{error, info, warn};
 
 // Packet counter for debugging
 static PACKET_COUNT: AtomicUsize = AtomicUsize::new(0);
+use lazy_static::lazy_static;
+use std::sync::Mutex;
 
+lazy_static! {
+    static ref NEW_BARCODE: Mutex<String> = Mutex::new(String::from(""));
+    static ref NEW_STATUS: Mutex<String> = Mutex::new(String::from(""));
+    static ref IS_TEST_START: Mutex<bool> = Mutex::new(false);
+    static ref PACKET_COUNTDOWN: Mutex<u8> = Mutex::new(0);
+    static ref TEST_STAGE: Mutex<u8> = Mutex::new(0);
+}
 // Barcode keys
-const BARCODE_KEY: &str = "010203040507"; // For CSV export
-const BARCODE_KEY_CLEAR: &str = "010203040508"; // For clearing database
+const BARCODE_KEY_SAVE: &str = "SAVE_DB"; // For CSV export
+const BARCODE_KEY_CLEAR: &str = "DEL_DB"; // For clearing database
 
 // Broadcaster actor to manage WebSocket clients and broadcast messages
 struct Broadcaster {
@@ -46,7 +55,10 @@ impl Handler<Connect> for Broadcaster {
 
     fn handle(&mut self, msg: Connect, _: &mut Self::Context) {
         self.clients.push(msg.0);
-        info!("New WebSocket client connected. Total clients: {}", self.clients.len());
+        info!(
+            "New WebSocket client connected. Total clients: {}",
+            self.clients.len()
+        );
     }
 }
 
@@ -55,7 +67,10 @@ impl Handler<Disconnect> for Broadcaster {
 
     fn handle(&mut self, msg: Disconnect, _: &mut Self::Context) {
         self.clients.retain(|client| client != &msg.0);
-        info!("WebSocket client disconnected. Total clients: {}", self.clients.len());
+        info!(
+            "WebSocket client disconnected. Total clients: {}",
+            self.clients.len()
+        );
     }
 }
 
@@ -162,7 +177,9 @@ fn save_packet(conn: &Connection, timestamp: &str, barcode: &str, status: &str) 
 
 // Update packet in database
 fn update_packet(conn: &Connection, barcode: &str, timestamp: &str, status: &str) -> Result<bool> {
-    let mut stmt = conn.prepare("SELECT id FROM packets WHERE barcode = ?1 AND status = 'TEST' ORDER BY id DESC LIMIT 1")?;
+    let mut stmt = conn.prepare(
+        "SELECT id FROM packets WHERE barcode = ?1 AND status = 'TEST' ORDER BY id DESC LIMIT 1",
+    )?;
     let mut rows = stmt.query([barcode])?;
     if let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
@@ -170,7 +187,10 @@ fn update_packet(conn: &Connection, barcode: &str, timestamp: &str, status: &str
             "UPDATE packets SET timestamp = ?1, status = ?2 WHERE id = ?3",
             [timestamp, status, &id.to_string()],
         )?;
-        info!("Updated packet id {} for barcode {} to status {}", id, barcode, status);
+        info!(
+            "Updated packet id {} for barcode {} to status {}",
+            id, barcode, status
+        );
         Ok(true)
     } else {
         Ok(false)
@@ -291,7 +311,11 @@ async fn export_csv() -> impl Responder {
         }
     };
     let rows = match stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
     }) {
         Ok(rows) => rows,
         Err(e) => {
@@ -304,6 +328,10 @@ async fn export_csv() -> impl Responder {
     wtr.write_record(["Zaman", "Barkod", "Durum"]).unwrap();
     for row in rows {
         let (timestamp, barcode, status) = row.unwrap();
+        if barcode == BARCODE_KEY_SAVE || barcode == BARCODE_KEY_CLEAR {
+            info!("Skipping barcode {} in CSV export", barcode);
+            continue;
+        }
         wtr.write_record([timestamp, barcode, status]).unwrap();
     }
     let data = match wtr.into_inner() {
@@ -321,7 +349,10 @@ async fn export_csv() -> impl Responder {
 
     HttpResponse::Ok()
         .content_type("text/csv")
-        .append_header(("Content-Disposition", format!("attachment; filename=\"{}\"", filename)))
+        .append_header((
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        ))
         .body(data)
 }
 
@@ -353,7 +384,6 @@ fn tcp_server(sender: SyncSender<String>) {
 fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
     let mut buffer = [0; 1024];
     let mut temp_buffer = Vec::new();
-    const PACKET_LENGTH: usize = 13;
     let conn = init_db().expect("Failed to initialize database");
 
     loop {
@@ -368,86 +398,160 @@ fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
                 let mut offset = 0;
                 while let Some((packet, next_offset)) = extract_packet(&data[offset..]) {
                     let packet_id = PACKET_COUNT.fetch_add(1, Ordering::SeqCst);
-                    let hex = packet.iter().map(|b| format!("{:02X} ", b)).collect::<String>().trim().to_string();
+                    let hex = packet
+                        .iter()
+                        .map(|b| format!("{:02X} ", b))
+                        .collect::<String>()
+                        .trim()
+                        .to_string();
 
-                    let status = if packet.len() > 12 {
-                        match packet[12] {
-                            0x02 => "OK",
-                            0x03 => "HATA",
-                            0x04 => "TEST",
-                            _ => "Unknown",
-                        }
-                    } else {
-                        "Invalid (too short)"
-                    };
+                    if packet.len() > 8 {
+                        let mut new_barcode = NEW_BARCODE.lock().unwrap();
+                        let mut new_status = NEW_STATUS.lock().unwrap();
+                        let mut is_test_start = IS_TEST_START.lock().unwrap();
+                        let mut packet_countdown = PACKET_COUNTDOWN.lock().unwrap();
+                        let mut test_stage = TEST_STAGE.lock().unwrap();
 
-                    info!("Packet {} from ({:?}): Hex: {}, status: {}", packet_id, stream.peer_addr(), hex, status);
+                        *new_status = String::from("");
 
-                    if status == "OK" || status == "HATA" || status == "TEST" {
-                        let barcode: String = packet[2..8]
-                            .iter()
-                            .map(|b| format!("{:02X}", b))
-                            .collect::<Vec<String>>()
-                            .join("");
-
-                        // Handle special barcode keys
-                        if barcode == BARCODE_KEY {
-                            info!("Barcode {} matches CSV key, triggering CSV export", barcode);
+                        if *new_barcode == BARCODE_KEY_SAVE {
+                            info!(
+                                "Barcode {} matches CSV key, triggering CSV export",
+                                *new_barcode
+                            );
                             let json = r#"{"action": "export_csv"}"#.to_string();
                             if let Err(e) = sender.send(json) {
-                                error!("Error sending export_csv signal for barcode {}: {}", barcode, e);
+                                error!(
+                                    "Error sending export_csv signal for barcode {}: {}",
+                                    *new_barcode, e
+                                );
                             } else {
-                                info!("Export CSV signal sent for barcode {}", barcode);
+                                info!("Export CSV signal sent for barcode {}", *new_barcode);
                             }
-                        } else if barcode == BARCODE_KEY_CLEAR {
-                            info!("Barcode {} matches clear key, clearing database", barcode);
+                            *new_barcode = String::from("");
+                            offset += next_offset;
+                            continue; // Skip database saving and table update
+                        } else if *new_barcode == BARCODE_KEY_CLEAR {
+                            info!(
+                                "Barcode {} matches clear key, clearing database",
+                                *new_barcode
+                            );
                             if let Err(e) = clear_database(&conn) {
-                                error!("Error clearing database for barcode {}: {}", barcode, e);
+                                error!(
+                                    "Error clearing database for barcode {}: {}",
+                                    *new_barcode, e
+                                );
                             } else {
                                 let json = r#"{"action": "clear_database"}"#.to_string();
                                 if let Err(e) = sender.send(json) {
-                                    error!("Error sending clear_database signal for barcode {}: {}", barcode, e);
+                                    error!(
+                                        "Error sending clear_database signal for barcode {}: {}",
+                                        *new_barcode, e
+                                    );
                                 } else {
-                                    info!("Clear database signal sent for barcode {}", barcode);
+                                    info!(
+                                        "Clear database signal sent for barcode {}",
+                                        *new_barcode
+                                    );
                                 }
+                            }
+                            *new_barcode = String::from("");
+                            offset += next_offset;
+                            continue; // Skip database saving and table update
+                        } else if packet[4] == 0x4 && packet[5] == 0xC {
+                            let barcode: String = packet[6..]
+                                .iter()
+                                .filter(|&&b| b.is_ascii())
+                                .map(|&b| b as char)
+                                .collect();
+                            *new_barcode = barcode;
+                            *new_status = String::from("TEST");
+                            *is_test_start = false;
+                            *packet_countdown = 255;
+                            *test_stage = 0;
+                        } else if packet[4] == 0x1 && packet[5] == 0x5 {
+                            if *packet_countdown > packet[packet.len() - 2] {
+                                *packet_countdown = packet[packet.len() - 2];
+                                *test_stage += 1;
+                                if *test_stage > 3 {
+                                    *is_test_start = true;
+                                }
+                            }
+                        } else if packet[4] == 0x0 && packet[5] == 0x0 && *is_test_start == true {
+                            if packet[12] == 0x2 && *packet_countdown == 0x0 {
+                                *new_status = String::from("OK");
+                                *is_test_start = false;
+                                *test_stage = 0;
+                                *packet_countdown = 255;
+                            } else if packet[12] == 0x3 {
+                                *new_status = String::from("HATA");
+                                *is_test_start = false;
+                                *test_stage = 0;
+                                *packet_countdown = 255;
                             }
                         }
 
-                        let istanbul_offset = FixedOffset::east_opt(3 * 3600).unwrap();
-                        let datetime: DateTime<FixedOffset> = Utc::now().with_timezone(&istanbul_offset);
-                        let formatted_datetime = datetime.format("%Y-%m-%d %H:%M:%S").to_string();
+                        info!(
+                            "Packet {} from ({:?}): Hex: {}, status: {}",
+                            packet_id,
+                            stream.peer_addr(),
+                            hex,
+                            *new_status
+                        );
 
-                        // Check if we need to update an existing TEST packet
-                        let updated = if status == "OK" || status == "HATA" {
-                            update_packet(&conn, &barcode, &formatted_datetime, status).unwrap_or(false)
-                        } else {
-                            false
-                        };
+                        if *new_status == "OK" || *new_status == "HATA" || *new_status == "TEST" {
+                            // Handle special barcode keys
 
-                        // If updated, send update message; otherwise, save new packet
-                        if updated {
-                            let json = format!(
+                            let istanbul_offset = FixedOffset::east_opt(3 * 3600).unwrap();
+                            let datetime: DateTime<FixedOffset> =
+                                Utc::now().with_timezone(&istanbul_offset);
+                            let formatted_datetime =
+                                datetime.format("%Y-%m-%d %H:%M:%S").to_string();
+
+                            let updated = update_packet(
+                                &conn,
+                                &*new_barcode,
+                                &formatted_datetime,
+                                &*new_status,
+                            )
+                            .unwrap_or(false);
+
+                            // If updated, send update message; otherwise, save new packet
+                            if updated {
+                                let json = format!(
                                 "{{\"action\": \"update\", \"barcode\": \"{}\", \"timestamp\": \"{}\", \"status\": \"{}\"}}",
-                                barcode, formatted_datetime, status
+                                *new_barcode, formatted_datetime, *new_status
                             );
-                            if let Err(e) = sender.send(json) {
-                                error!("Error sending update packet {} to channel: {}", packet_id, e);
+                                if let Err(e) = sender.send(json) {
+                                    error!(
+                                        "Error sending update packet {} to channel: {}",
+                                        packet_id, e
+                                    );
+                                } else {
+                                    info!("Update packet {} sent to broadcaster", packet_id);
+                                }
                             } else {
-                                info!("Update packet {} sent to broadcaster", packet_id);
-                            }
-                        } else {
-                            if let Err(e) = save_packet(&conn, &formatted_datetime, &barcode, status) {
-                                error!("Failed to save packet {} to database: {}", packet_id, e);
-                            }
+                                if let Err(e) = save_packet(
+                                    &conn,
+                                    &formatted_datetime,
+                                    &*new_barcode,
+                                    &*new_status,
+                                ) {
+                                    error!(
+                                        "Failed to save packet {} to database: {}",
+                                        packet_id, e
+                                    );
+                                }
 
-                            let json = format!(
+                                let json = format!(
                                 "{{\"timestamp\": \"{}\", \"barcode\": \"{}\", \"status\": \"{}\"}}",
-                                formatted_datetime, barcode, status
+                                formatted_datetime, *new_barcode, *new_status
                             );
-                            if let Err(e) = sender.send(json) {
-                                error!("Error sending packet {} to channel: {}", packet_id, e);
-                            } else {
-                                info!("Packet {} sent to broadcaster", packet_id);
+                                if let Err(e) = sender.send(json) {
+                                    error!("Error sending packet {} to channel: {}", packet_id, e);
+                                } else {
+                                    info!("Packet {} sent to broadcaster", packet_id);
+                                }
                             }
                         }
                     }
@@ -476,20 +580,30 @@ fn extract_packet(buffer: &[u8]) -> Option<(&[u8], usize)> {
         Some(pos) => pos,
         None => {
             if !buffer.is_empty() {
-                let invalid_data = buffer.iter().map(|b| format!("{:02X} ", b)).collect::<String>().trim().to_string();
+                let invalid_data = buffer
+                    .iter()
+                    .map(|b| format!("{:02X} ", b))
+                    .collect::<String>()
+                    .trim()
+                    .to_string();
                 warn!("Invalid data skipped (no 5A A5 start): {}", invalid_data);
             }
             return None;
         }
     };
 
-    const PACKET_LENGTH: usize = 13;
-    if buffer.len() < start + PACKET_LENGTH {
+    if buffer.len() < start + 3 {
         return None;
     }
 
-    let packet = &buffer[start..start + PACKET_LENGTH];
-    let next_offset = start + PACKET_LENGTH;
+    let packet_length = buffer[start + 3] as usize;
+
+    if buffer.len() < start + packet_length {
+        return None;
+    }
+
+    let packet = &buffer[start..start + packet_length];
+    let next_offset = start + packet_length;
     Some((packet, next_offset))
 }
 
@@ -503,7 +617,10 @@ async fn main() -> std::io::Result<()> {
         Ok(conn) => conn,
         Err(e) => {
             error!("Failed to initialize database: {}", e);
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Database initialization failed: {}", e)));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Database initialization failed: {}", e),
+            ));
         }
     };
     info!("Database initialized successfully");
