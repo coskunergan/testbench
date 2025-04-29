@@ -7,11 +7,14 @@ use rusqlite::{Connection, Result};
 use serde::Serialize;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread;
 use std::time::Duration;
+use sysinfo::{Disk, Disks};
 use tracing::{error, info, warn};
+use tracing_subscriber;
 
 use lazy_static::lazy_static;
 use std::sync::Mutex;
@@ -28,7 +31,7 @@ lazy_static! {
 }
 
 // Barcode keys
-const BARCODE_KEY_SAVE: &str = "SAVE_DB"; // For CSV export
+const BARCODE_KEY_SAVE: &str = "SAVE_DB"; // For CSV export and flash disk save
 const BARCODE_KEY_CLEAR: &str = "DEL_DB"; // For clearing database
 
 // Broadcaster actor to manage WebSocket clients and broadcast messages
@@ -296,7 +299,38 @@ async fn get_report(_req: HttpRequest) -> impl Responder {
     HttpResponse::Ok().json(report)
 }
 
-// Export packets as CSV
+// Generate CSV content (used by both export_csv and flash disk save)
+fn generate_csv_content(conn: &Connection) -> Result<Vec<u8>, String> {
+    let mut stmt = conn
+        .prepare("SELECT timestamp, barcode, status FROM packets")
+        .map_err(|e| format!("Failed to prepare statement: {}", e))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| format!("Failed to query packets: {}", e))?;
+
+    let mut wtr = WriterBuilder::new().from_writer(vec![]);
+    wtr.write_record(["Zaman", "Barkod", "Durum"])
+        .map_err(|e| format!("Failed to write CSV header: {}", e))?;
+    for row in rows {
+        let (timestamp, barcode, status) = row.map_err(|e| format!("Failed to read row: {}", e))?;
+        if barcode == BARCODE_KEY_SAVE || barcode == BARCODE_KEY_CLEAR {
+            info!("Skipping barcode {} in CSV export", barcode);
+            continue;
+        }
+        wtr.write_record([timestamp, barcode, status])
+            .map_err(|e| format!("Failed to write CSV row: {}", e))?;
+    }
+    wtr.into_inner()
+        .map_err(|e| format!("Failed to generate CSV: {}", e))
+}
+
+// Export packets as CSV for browser download
 async fn export_csv() -> impl Responder {
     let conn = match Connection::open("testbench.db") {
         Ok(conn) => conn,
@@ -305,41 +339,11 @@ async fn export_csv() -> impl Responder {
             return HttpResponse::InternalServerError().body("Database error");
         }
     };
-    let mut stmt = match conn.prepare("SELECT timestamp, barcode, status FROM packets") {
-        Ok(stmt) => stmt,
-        Err(e) => {
-            error!("Failed to prepare statement: {}", e);
-            return HttpResponse::InternalServerError().body("Database error");
-        }
-    };
-    let rows = match stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    }) {
-        Ok(rows) => rows,
-        Err(e) => {
-            error!("Failed to query packets: {}", e);
-            return HttpResponse::InternalServerError().body("Database error");
-        }
-    };
 
-    let mut wtr = WriterBuilder::new().from_writer(vec![]);
-    wtr.write_record(["Zaman", "Barkod", "Durum"]).unwrap();
-    for row in rows {
-        let (timestamp, barcode, status) = row.unwrap();
-        if barcode == BARCODE_KEY_SAVE || barcode == BARCODE_KEY_CLEAR {
-            info!("Skipping barcode {} in CSV export", barcode);
-            continue;
-        }
-        wtr.write_record([timestamp, barcode, status]).unwrap();
-    }
-    let data = match wtr.into_inner() {
+    let data = match generate_csv_content(&conn) {
         Ok(data) => data,
         Err(e) => {
-            error!("Failed to generate CSV: {}", e);
+            error!("{}", e);
             return HttpResponse::InternalServerError().body("CSV error");
         }
     };
@@ -356,6 +360,36 @@ async fn export_csv() -> impl Responder {
             format!("attachment; filename=\"{}\"", filename),
         ))
         .body(data)
+}
+
+// Save CSV to flash disk if available
+fn save_csv_to_flash_disk(csv_data: &[u8], filename: &str) -> Result<(), String> {
+    let disks = Disks::new_with_refreshed_list();
+
+    for disk in disks.iter() {
+        if disk.is_removable() {
+            let mount_point = disk.mount_point().to_string_lossy().to_string();
+            if Path::new(&mount_point).exists() && Path::new(&mount_point).is_dir() {
+                // Test write permission
+                let test_file = Path::new(&mount_point).join(".test_write");
+                if std::fs::write(&test_file, "").is_ok() {
+                    let _ = std::fs::remove_file(&test_file); // Clean up
+                    let file_path = Path::new(&mount_point).join(filename);
+                    std::fs::write(&file_path, csv_data).map_err(|e| {
+                        format!(
+                            "Failed to write CSV to flash disk at {}: {}",
+                            file_path.display(),
+                            e
+                        )
+                    })?;
+                    info!("CSV saved to flash disk at: {}", file_path.display());
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    Err("No writable flash disk found".to_string())
 }
 
 fn tcp_server(sender: SyncSender<String>) {
@@ -445,6 +479,29 @@ fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
                                     "Export CSV signal sent for barcode {}, skipping packet saving and table update",
                                     *new_barcode
                                 );
+
+                                // Generate CSV content and save to flash disk
+                                let csv_data = match generate_csv_content(&conn) {
+                                    Ok(data) => data,
+                                    Err(e) => {
+                                        error!("Failed to generate CSV for flash disk: {}", e);
+                                        vec![]
+                                    }
+                                };
+
+                                if !csv_data.is_empty() {
+                                    let istanbul_offset = FixedOffset::east_opt(3 * 3600).unwrap();
+                                    let datetime: DateTime<FixedOffset> =
+                                        Utc::now().with_timezone(&istanbul_offset);
+                                    let filename = format!(
+                                        "data_{}.csv",
+                                        datetime.format("%Y-%m-%d_%H-%M-%S")
+                                    );
+
+                                    if let Err(e) = save_csv_to_flash_disk(&csv_data, &filename) {
+                                        warn!("Failed to save CSV to flash disk: {}", e);
+                                    }
+                                }
                             }
                             *new_barcode = String::from("");
                             offset += next_offset;
