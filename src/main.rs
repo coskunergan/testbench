@@ -13,10 +13,11 @@ use std::thread;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
-// Packet counter for debugging
-static PACKET_COUNT: AtomicUsize = AtomicUsize::new(0);
 use lazy_static::lazy_static;
 use std::sync::Mutex;
+
+// Packet counter for debugging
+static PACKET_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 lazy_static! {
     static ref NEW_BARCODE: Mutex<String> = Mutex::new(String::from(""));
@@ -25,6 +26,7 @@ lazy_static! {
     static ref PACKET_COUNTDOWN: Mutex<u8> = Mutex::new(0);
     static ref TEST_STAGE: Mutex<u8> = Mutex::new(0);
 }
+
 // Barcode keys
 const BARCODE_KEY_SAVE: &str = "SAVE_DB"; // For CSV export
 const BARCODE_KEY_CLEAR: &str = "DEL_DB"; // For clearing database
@@ -79,7 +81,7 @@ impl Handler<ClientMessage> for Broadcaster {
 
     fn handle(&mut self, msg: ClientMessage, _: &mut Self::Context) {
         for client in &self.clients {
-            client.do_send(WsMessage(msg.0.clone()));
+            client.do_send(WsMessage(msg.0.clone())); // Clone to avoid move
         }
     }
 }
@@ -252,7 +254,7 @@ struct Report {
     total: i64,
 }
 
-async fn get_report(req: HttpRequest) -> impl Responder {
+async fn get_report(_req: HttpRequest) -> impl Responder {
     let conn = match Connection::open("testbench.db") {
         Ok(conn) => conn,
         Err(e) => {
@@ -398,22 +400,35 @@ fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
                 let mut offset = 0;
                 while let Some((packet, next_offset)) = extract_packet(&data[offset..]) {
                     let packet_id = PACKET_COUNT.fetch_add(1, Ordering::SeqCst);
-                    let hex = packet
-                        .iter()
-                        .map(|b| format!("{:02X} ", b))
-                        .collect::<String>()
-                        .trim()
-                        .to_string();
+                    let hex_temp: String = packet.iter().map(|b| format!("{:02X} ", b)).collect();
+                    let hex = hex_temp.trim();
 
                     if packet.len() > 8 {
-                        let mut new_barcode = NEW_BARCODE.lock().unwrap();
-                        let mut new_status = NEW_STATUS.lock().unwrap();
-                        let mut is_test_start = IS_TEST_START.lock().unwrap();
-                        let mut packet_countdown = PACKET_COUNTDOWN.lock().unwrap();
-                        let mut test_stage = TEST_STAGE.lock().unwrap();
+                        // Lock all mutexes safely
+                        let mut new_barcode = NEW_BARCODE.lock().unwrap_or_else(|e| {
+                            error!("Mutex poisoned for NEW_BARCODE: {}", e);
+                            panic!("Mutex poisoned");
+                        });
+                        let mut new_status = NEW_STATUS.lock().unwrap_or_else(|e| {
+                            error!("Mutex poisoned for NEW_STATUS: {}", e);
+                            panic!("Mutex poisoned");
+                        });
+                        let mut is_test_start = IS_TEST_START.lock().unwrap_or_else(|e| {
+                            error!("Mutex poisoned for IS_TEST_START: {}", e);
+                            panic!("Mutex poisoned");
+                        });
+                        let mut packet_countdown = PACKET_COUNTDOWN.lock().unwrap_or_else(|e| {
+                            error!("Mutex poisoned for PACKET_COUNTDOWN: {}", e);
+                            panic!("Mutex poisoned");
+                        });
+                        let mut test_stage = TEST_STAGE.lock().unwrap_or_else(|e| {
+                            error!("Mutex poisoned for TEST_STAGE: {}", e);
+                            panic!("Mutex poisoned");
+                        });
 
                         *new_status = String::from("");
 
+                        // Handle special barcode keys
                         if *new_barcode == BARCODE_KEY_SAVE {
                             info!(
                                 "Barcode {} matches CSV key, triggering CSV export",
@@ -426,11 +441,14 @@ fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
                                     *new_barcode, e
                                 );
                             } else {
-                                info!("Export CSV signal sent for barcode {}", *new_barcode);
+                                info!(
+                                    "Export CSV signal sent for barcode {}, skipping packet saving and table update",
+                                    *new_barcode
+                                );
                             }
                             *new_barcode = String::from("");
                             offset += next_offset;
-                            continue; // Skip database saving and table update
+                            continue;
                         } else if *new_barcode == BARCODE_KEY_CLEAR {
                             info!(
                                 "Barcode {} matches clear key, clearing database",
@@ -450,15 +468,18 @@ fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
                                     );
                                 } else {
                                     info!(
-                                        "Clear database signal sent for barcode {}",
+                                        "Clear database signal sent for barcode {}, skipping packet saving and table update",
                                         *new_barcode
                                     );
                                 }
                             }
                             *new_barcode = String::from("");
                             offset += next_offset;
-                            continue; // Skip database saving and table update
-                        } else if packet[4] == 0x4 && packet[5] == 0xC {
+                            continue;
+                        }
+
+                        // Process packet for barcode and status
+                        if packet[4] == 0x4 && packet[5] == 0xC {
                             let barcode: String = packet[6..]
                                 .iter()
                                 .filter(|&&b| b.is_ascii())
@@ -477,7 +498,7 @@ fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
                                     *is_test_start = true;
                                 }
                             }
-                        } else if packet[4] == 0x0 && packet[5] == 0x0 && *is_test_start == true {
+                        } else if packet[4] == 0x0 && packet[5] == 0x0 && *is_test_start {
                             if packet[12] == 0x2 && *packet_countdown == 0x0 {
                                 *new_status = String::from("OK");
                                 *is_test_start = false;
@@ -499,29 +520,32 @@ fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
                             *new_status
                         );
 
-                        if *new_status == "OK" || *new_status == "HATA" || *new_status == "TEST" {
-                            // Handle special barcode keys
-
+                        // Save or update packet if status is valid
+                        if !new_status.is_empty() {
                             let istanbul_offset = FixedOffset::east_opt(3 * 3600).unwrap();
                             let datetime: DateTime<FixedOffset> =
                                 Utc::now().with_timezone(&istanbul_offset);
                             let formatted_datetime =
                                 datetime.format("%Y-%m-%d %H:%M:%S").to_string();
 
-                            let updated = update_packet(
+                            let updated = match update_packet(
                                 &conn,
                                 &*new_barcode,
                                 &formatted_datetime,
                                 &*new_status,
-                            )
-                            .unwrap_or(false);
+                            ) {
+                                Ok(val) => val,
+                                Err(e) => {
+                                    error!("Failed to update packet {}: {}", packet_id, e);
+                                    false
+                                }
+                            };
 
-                            // If updated, send update message; otherwise, save new packet
                             if updated {
                                 let json = format!(
-                                "{{\"action\": \"update\", \"barcode\": \"{}\", \"timestamp\": \"{}\", \"status\": \"{}\"}}",
-                                *new_barcode, formatted_datetime, *new_status
-                            );
+                                    "{{\"action\": \"update\", \"barcode\": \"{}\", \"timestamp\": \"{}\", \"status\": \"{}\"}}",
+                                    *new_barcode, formatted_datetime, *new_status
+                                );
                                 if let Err(e) = sender.send(json) {
                                     error!(
                                         "Error sending update packet {} to channel: {}",
@@ -541,16 +565,19 @@ fn handle_client(mut stream: TcpStream, sender: SyncSender<String>) {
                                         "Failed to save packet {} to database: {}",
                                         packet_id, e
                                     );
-                                }
-
-                                let json = format!(
-                                "{{\"timestamp\": \"{}\", \"barcode\": \"{}\", \"status\": \"{}\"}}",
-                                formatted_datetime, *new_barcode, *new_status
-                            );
-                                if let Err(e) = sender.send(json) {
-                                    error!("Error sending packet {} to channel: {}", packet_id, e);
                                 } else {
-                                    info!("Packet {} sent to broadcaster", packet_id);
+                                    let json = format!(
+                                        "{{\"timestamp\": \"{}\", \"barcode\": \"{}\", \"status\": \"{}\"}}",
+                                        formatted_datetime, *new_barcode, *new_status
+                                    );
+                                    if let Err(e) = sender.send(json) {
+                                        error!(
+                                            "Error sending packet {} to channel: {}",
+                                            packet_id, e
+                                        );
+                                    } else {
+                                        info!("Packet {} sent to broadcaster", packet_id);
+                                    }
                                 }
                             }
                         }
@@ -580,12 +607,9 @@ fn extract_packet(buffer: &[u8]) -> Option<(&[u8], usize)> {
         Some(pos) => pos,
         None => {
             if !buffer.is_empty() {
-                let invalid_data = buffer
-                    .iter()
-                    .map(|b| format!("{:02X} ", b))
-                    .collect::<String>()
-                    .trim()
-                    .to_string();
+                let invalid_data_temp: String =
+                    buffer.iter().map(|b| format!("{:02X} ", b)).collect();
+                let invalid_data = invalid_data_temp.trim();
                 warn!("Invalid data skipped (no 5A A5 start): {}", invalid_data);
             }
             return None;
@@ -635,9 +659,7 @@ async fn main() -> std::io::Result<()> {
 
     let broadcaster_clone = broadcaster.clone();
     thread::spawn(move || {
-        let mut packet_id = 0;
         while let Ok(message) = receiver.recv() {
-            packet_id += 1;
             broadcaster_clone.do_send(ClientMessage(message));
         }
     });
