@@ -40,6 +40,9 @@
             color: white;
             text-align: center;
         }
+        .same-barcode {
+            background-color: orange;
+        }
         th:nth-child(1), td:nth-child(1) {
             width: 20%;
         }
@@ -94,6 +97,31 @@
         const BARCODE_KEY_SAVE = 'SAVE_DB';
         const BARCODE_KEY_CLEAR = 'DEL_DB';
 
+        function colorDuplicateBarcodes() {
+            const rows = tableBody.getElementsByTagName('tr');
+            // Tüm hücrelerden .same-barcode sınıfını kaldır
+            for (let row of rows) {
+                row.cells[1].classList.remove('same-barcode');
+            }
+            // En güncel satırın durumu OK ise renklendirme yapma
+            if (rows.length > 0 && rows[0].cells[2].textContent === 'OK') {
+                return;
+            }
+            // En üstteki ardışık aynı barkodları veya tek barkodu renklendir
+            if (rows.length > 0) {
+                let i = 0;
+                const firstBarcode = rows[0].cells[1].textContent;
+                // Ardışık aynı barkodları kontrol et
+                while (i < rows.length - 1 && rows[i + 1].cells[1].textContent === firstBarcode) {
+                    rows[i].cells[1].classList.add('same-barcode');
+                    rows[i + 1].cells[1].classList.add('same-barcode');
+                    i++;
+                }
+                // İlk satırı renklendir (grup varsa veya tekse)
+                rows[0].cells[1].classList.add('same-barcode');
+            }
+        }
+
         async function loadPackets() {
             try {
                 const response = await fetch('/packets');
@@ -112,6 +140,7 @@
                     `;
                     tableBody.appendChild(row);
                 });
+                colorDuplicateBarcodes();
             } catch (e) {
                 console.error('Error fetching packets:', e);
             }
@@ -159,6 +188,7 @@
                             break;
                         }
                     }
+                    colorDuplicateBarcodes();
                     updateReport();
                 } else {
                     if (data.barcode === BARCODE_KEY_SAVE || data.barcode === BARCODE_KEY_CLEAR) {
@@ -172,6 +202,7 @@
                         <td class="${data.status === 'OK' ? 'status-ok' : data.status === 'HATA' ? 'status-hata' : 'status-test'}">${data.status}</td>
                     `;
                     tableBody.insertBefore(row, tableBody.firstChild);
+                    colorDuplicateBarcodes();
                     updateReport();
                 }
             } catch (e) {
@@ -191,5 +222,6 @@
             window.location.href = '/export';
         }
     </script>
+<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'9386fb28a89d672f',t:'MTc0NjAxNTQ5OS4wMDAwMDA='};var a=document.createElement('script');a.nonce='';a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script>
 </body>
 </html>
